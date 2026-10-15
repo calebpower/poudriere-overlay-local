@@ -1,0 +1,156 @@
+poudriere overlay: local-fixes
+==============================
+
+Local patches to ports that are broken in the base tree. Registered as a
+poudriere ports tree and passed to bulk with -O, so poudriere looks here
+BEFORE /usr/ports (common.sh:1447 _lookup_portdir) and falls through to the
+base tree for everything else.
+
+An overlay entry is the WHOLE port directory, not a diff: _lookup_portdir
+returns the overlay path AS the port dir and does not merge with /usr/ports,
+so distinfo, pkg-descr, pkg-plist and files/ must all be present.
+
+The category Makefiles here exist only so `poudriere bulk -a` would enumerate
+the overlay (_list_ports_dir, common.sh:9479, skips an overlay with no
+top-level Makefile). Builds from an explicit list do not need them.
+
+
+x11/xlockmore  --  restores `tar:xz` to USES
+-------------------------------------------
+Base tree resolves EXTRACT_SUFX to .tar.gz while distinfo holds the .tar.xz
+hash, so fetch refuses:
+
+    => xlockmore-5.88.tar.gz is not in .../distinfo.
+
+Cause: ports commit 6cd3e0d85531 (Gleb Popov, 2026-09-08, PR 298092),
+"xorg-cat.mk users: Drop tar:xz, which is default now", removed tar:xz from
+178 ports. The premise holds for USES=xorg-cat, where Mk/Uses/xorg-cat.mk:71
+sets EXTRACT_SUFX?=.tar.xz. xlockmore uses USES=xorg, and Mk/Uses/xorg.mk sets
+nothing about tarballs -- so it fell back to the global .tar.gz default.
+tar:xz had been correct for this port since 5.80 (Oct 2024).
+
+Of the 178 swept ports, this is the only one actually broken: the other
+non-xorg-cat port, x11-drivers/xf86-video-qxl, still resolves .tar.xz.
+Checked by comparing resolved DISTFILES against distinfo, not by the USES
+heuristic, which gave one false positive.
+
+WHY IT MATTERS HERE: xlockmore is installed, xautolock requires it, and
+~/.xinitrc:39 runs `xautolock -time 20 -locker lock` -- it is the screen lock.
+
+EXIT CONDITION: drop this port from the overlay once the base tree's
+x11/xlockmore/Makefile has tar:xz in USES again. Worth reporting upstream;
+PR 298092 was right for 177 of 178.
+
+
+security/py-authlib  --  removes a stray line-continuation backslash
+--------------------------------------------------------------------
+Base tree's Makefile ends the FLASK_RUN_DEPENDS block with a trailing ` \`,
+so make continues the assignment onto the next line and swallows the
+JOSE_RUN_DEPENDS= text as a literal token. Measured on the base tree:
+
+    JOSE_RUN_DEPENDS  = <empty -- never assigned>
+    FLASK_RUN_DEPENDS = ...py-flask... ...py-flask-sqlalchemy...
+                        JOSE_RUN_DEPENDS=  py312-pycryptodomex>=3.10<4:...
+
+JOSE is a real option (OPTIONS_DEFINE= CLIENTS DJANGO FLASK JOSE), so with
+JOSE selected the pycryptodomex dependency is silently absent while FLASK
+gains a bogus entry.
+
+Cause: ports commit a6c7ebf9994b (Po-Chuan Hsieh, 2025-03-19), "security/
+py-authlib: Add CLIENTS, DJANGO, FLASK and JOSE options". Present since
+March 2025 and survived the bump to 1.8.0. Reported upstream by cal; the bug
+report is open at the time of writing.
+
+EXIT CONDITION: drop this port once the base tree's line no longer ends in a
+backslash -- or simply once `make -C /usr/ports/security/py-authlib -V
+JOSE_RUN_DEPENDS` is non-empty.
+
+
+archivers/zpaqfranz  --  patches upstream's Makefile for install(1)
+-------------------------------------------------------------------
+Stage fails, exit 64, reproduced in the 2026-10-08 21:35 bulk as well as the
+Oct 1 one:
+
+    install  -s -m 555 -l s zpaqfranz <stage>/usr/local/bin/dir
+    install: -l and -s may not be specified together
+
+Cause is in UPSTREAM's Makefile, inside the distfile, not the port:
+
+     8  BSD_INSTALL_PROGRAM?=  install -m 0555
+    12      ${BSD_INSTALL_PROGRAM} ${PROG} ${DESTDIR}${BINDIR}
+    13      ${BSD_INSTALL_PROGRAM} -l s ${PROG} ${DESTDIR}${BINDIR}/dir
+
+Line 8 is `?=`, so the framework's value wins -- here `install -s -m 555`.
+Line 13 appends `-l s` to it, asking install(1) to strip and symlink in one
+call, which FreeBSD refuses. GNU coreutils install does not, which is likely
+why upstream never saw it.
+
+files/patch-Makefile replaces line 13 with `ln -sf`, which needs nothing from
+the framework and makes the same relative symlink the port's own
+`post-install-DIRCOMMAND-off: ${RM} ${STAGEDIR}${LOCALBASE}/bin/dir` already
+assumes exists.
+
+TURNING THE OPTION OFF IS NOT A WORKAROUND. bgone has
+OPTIONS_FILE_UNSET+=DIRCOMMAND, but the port lets upstream create the symlink
+and deletes it afterwards -- and the failure is in `install`, which runs before
+any post-install target. The option is unreachable.
+
+Verified: the patch dry-runs and applies clean against a pristine extraction of
+zpaqfranz-55.12.tar.gz; the old line reproduces the exact error when driven with
+the framework's real INSTALL_PROGRAM, and `ln -sf` returns 0 and creates the
+symlink. The port carries no files/ directory in the base tree, so this is the
+first patch it has ever had.
+
+EXIT CONDITION: drop this port once the base tree's
+archivers/zpaqfranz/files/ contains a patch for the same line, or once upstream
+ships a Makefile whose line 13 does not pass -l to a stripping install. Worth
+reporting upstream to franco@francocorbelli.com / the port maintainer, who is
+the same person.
+
+
+Verifying the overlay after a ports update
+------------------------------------------
+Both fixes are detectable in one command each, against the BASE tree:
+
+    make -C /usr/ports/x11/xlockmore -V DISTFILES          # want .tar.xz
+    make -C /usr/ports/security/py-authlib -V JOSE_RUN_DEPENDS   # want non-empty
+
+If either now reports the fixed value, the base tree has caught up and that
+port should leave the overlay -- a stale override is the thing an overlay is
+most likely to go wrong by.
+
+
+bgone does NOT see this overlay
+-------------------------------
+bgone carries ONE ports tree root (`-p/--ports-dir`, default /usr/ports; or
+`--poudriere-ports <TREE>`, which is also one tree) and has no overlay flag --
+not in --help, not in bgone.toml, and no overlay string in the binary. So when
+you configure options, bgone evaluates the BASE tree.
+
+Measured cost, by diffing every variable bgone reads, base vs overlay:
+
+  x11/xlockmore        every one identical. Its defect is EXTRACT_SUFX, which
+                       affects fetch and nothing bgone looks at. No cost.
+  security/py-authlib  JOSE_RUN_DEPENDS and FLASK_RUN_DEPENDS differ.
+
+So the cost is one port and it is LATENT: RUN_DEPENDS reads the same today only
+because neither option is selected. Select JOSE in bgone and bgone will believe
+JOSE adds no dependency; select FLASK and it shows a bogus `JOSE_RUN_DEPENDS=`
+entry. That is exactly the decision bgone exists to inform.
+
+IT DOES NOT BREAK THE BUILD. poudriere resolves the closure itself
+(deps_fetch_vars, common.sh:7062) from the OVERLAID Makefile, so
+py312-pycryptodomex is pulled in correctly even if bgone's list omits it.
+(It is currently in neither the local repo nor local-all.txt, so it would be a
+new build either way.)
+
+`--poudriere-ports local-fixes` is mechanically accepted -- the overlay is a
+registered tree -- but it has no fallthrough, so dependency resolution for
+every other port fails. Not a usable workaround.
+
+THE REAL FIX is an overlay flag in bgone, same shape as poudriere's: search the
+overlays first, fall back to ports_dir. The root already flows through one place
+(src/cli.rs:383, `derived.ports_dir = Some(poudriere.ports_dir(tree)?)`), so it
+is a Vec<PathBuf> plus a first-match-wins lookup rather than a scattered change.
+Until then: when configuring security/py-authlib, JOSE's pycryptodomex
+dependency is real even though bgone shows none.
