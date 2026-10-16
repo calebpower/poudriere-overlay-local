@@ -108,12 +108,106 @@ reporting upstream to franco@francocorbelli.com / the port maintainer, who is
 the same person.
 
 
+graphics/opencv  --  tells cmake where the JDK is
+--------------------------------------------------
+With JAVA selected, the build SUCCEEDS for 1h43m and then package fails, in the
+2026-10-14 18:03 bulk:
+
+    pkg-static: Unable to access file <stage>/usr/local/share/java/opencv4/
+                libopencv_java4130.so:No such file or directory
+    pkg-static: Unable to access file <stage>/usr/local/share/java/opencv4/
+                opencv-4130.jar:No such file or directory
+
+cmake had already said so, 3000 lines earlier, without failing:
+
+    1319  -- Could NOT find JNI (missing: JAVA_INCLUDE_PATH JAVA_INCLUDE_PATH2
+                                          AWT JVM)
+    1690  --     JNI:                         NO
+    1691  --     Java wrappers:               NO
+
+Cause is the port, not upstream and not a missing JDK. Everything FindJNI wants
+is installed -- openjdk25 was pulled in as ant's dependency and carries
+include/jni.h, include/freebsd/jni_md.h, lib/libawt.so and
+lib/server/libjvm.so. But FindJNI derives all four from _JAVA_HOME, and
+CMakeFindJavaCommon.cmake sets that from exactly three sources in order: the
+JAVA_HOME cmake variable, then $ENV{JAVA_HOME}, then an APPLE-only
+/usr/libexec/java_home probe. On FreeBSD the third never fires, and the port
+sets neither of the first two -- JAVA_MAKE_ENV passes JAVACMD, which reaches the
+BUILD phase and not configure. JAVA_HOME appears zero times in the whole build
+log.
+
+So the option is advertised, silently produces nothing, and costs an hour and
+three quarters before the plist entries it enables fail on files that were
+never built. opencv's cmake does not treat BUILD_JAVA=ON plus JNI=NO as an
+error, which is what makes it quiet.
+
+NOT A REGRESSION IN THE PORT -- A JDK MOVE UNDER IT. The same port with JAVA on
+built fine on 14-3 at 4.11.0_3, where ant brought openjdk8:
+
+    1334  -- Found JNI: /usr/local/openjdk8/include  found components: AWT JVM
+    1718  --     Java wrappers:               YES (ANT)
+
+openjdk8 keeps libjvm under jre/lib/<arch>/server and FindJNI's unhinted guesses
+reach it; a modular JDK (17, 25) keeps it under lib/server and they do not.
+The missing hint has always been missing; it only became fatal when the default
+JDK moved.
+
+THE FIX is one line, JAVA_CMAKE_ON= -DJAVA_HOME:PATH=${JAVA_HOME}. The ports
+Java framework already computes JAVA_HOME from the JDK the port itself depends
+on (USES=java), so the value is right by construction and follows a future
+default-JDK move without editing. With it set, FindJNI resolves all four:
+include (FindJNI.cmake:357), include/freebsd for jni_md.h (:505-510),
+lib for libawt (:227-231), and ${dir}/server for libjvm (:341-347).
+
+A SECOND, UNRELATED CHANGE IS REQUIRED BY THE OVERLAY ITSELF, and it is not part
+of the Java bug: the base Makefile reaches a sibling port by relative path,
+`.include <../../math/vtk9/Makefile.version>` (for VTK_VER, used by
+VTK_LIB_DEPENDS and read even when VTK is off). Because an overlay entry
+REPLACES the port dir rather than merging, that path resolves inside the overlay,
+where math/ does not exist, and make dies before reading anything:
+
+    make: .../graphics/opencv/Makefile:258: Could not find
+          ../../math/vtk9/Makefile.version
+
+Spelled "${PORTSDIR}/math/vtk9/Makefile.version" it resolves to the base tree
+from either location. Deliberately NOT solved by adding math/vtk9/ to the
+overlay: the overlay is searched first, so a partial vtk9 directory risks
+capturing lookups for the real port, which builds fine today.
+
+VERIFIED, and the limit is stated because it matters: with JAVA on, the overlay
+adds -DJAVA_HOME:PATH=/usr/local/openjdk17 to CMAKE_ARGS and the base tree adds
+nothing (1 against 0); with JAVA off the overlay adds nothing either, so the
+knob is gated on the option. JAVA_CMAKE_ON is a real options helper
+(bsd.options.mk:98 and the list at :198) and real ports pass full -D strings
+through it (graphics/blender, graphics/alembic). The port evaluates after the
+include change (PORTNAME=opencv, VTK_VER=9.6). Every variable bgone and
+poudriere read is byte-identical to the base tree -- PKGNAME, OPTIONS_DEFINE,
+OPTIONS_DEFAULT, BUILD_DEPENDS, LIB_DEPENDS, RUN_DEPENDS, USES, PLIST_SUB --
+and only CMAKE_ARGS differs. WHAT IS NOT VERIFIED: that cmake then actually
+builds and stages the .so and the .jar. That needs the 1h43m build; the
+mechanism is proven, the outcome is not.
+
+bgone cost: NONE. It reads none of CMAKE_ARGS, and every variable it does read
+is identical above.
+
+EXIT CONDITION: drop this port once the base tree hands cmake the JDK itself --
+
+    env WITH=JAVA make -C /usr/ports/graphics/opencv -V CMAKE_ARGS | grep -c JAVA_HOME
+
+non-zero means the base tree has caught up, whichever mechanism it chose
+(JAVA_CMAKE_ON, CONFIGURE_ENV, or explicit JAVA_INCLUDE_PATH/JAVA_JVM_LIBRARY).
+Worth reporting upstream to the port maintainer: the option is unbuildable as
+shipped on any modular JDK, and it fails late.
+
+
 Verifying the overlay after a ports update
 ------------------------------------------
 Both fixes are detectable in one command each, against the BASE tree:
 
     make -C /usr/ports/x11/xlockmore -V DISTFILES          # want .tar.xz
     make -C /usr/ports/security/py-authlib -V JOSE_RUN_DEPENDS   # want non-empty
+    env WITH=JAVA make -C /usr/ports/graphics/opencv -V CMAKE_ARGS \
+        | grep -c JAVA_HOME                                # want non-zero
 
 If either now reports the fixed value, the base tree has caught up and that
 port should leave the overlay -- a stale override is the thing an overlay is
