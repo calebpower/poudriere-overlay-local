@@ -3,43 +3,66 @@ poudriere overlay: local-fixes
 
 Local patches to ports that are broken in the base tree. Registered as a
 poudriere ports tree and passed to bulk with -O, so poudriere looks here
-BEFORE /usr/ports (common.sh:1447 _lookup_portdir) and falls through to the
-base tree for everything else.
+BEFORE the base ports tree (common.sh:1447 _lookup_portdir) and falls through
+to it for everything else.
 
 An overlay entry is the WHOLE port directory, not a diff: _lookup_portdir
-returns the overlay path AS the port dir and does not merge with /usr/ports,
+returns the overlay path AS the port dir and does not merge with the base tree,
 so distinfo, pkg-descr, pkg-plist and files/ must all be present.
+
+THIS REPO IS THE UNION OF MORE THAN ONE POUDRIERE INSTANCE, which is the thing
+to know before removing anything from it: an entry your own instance does not
+need is not dead. The two it is maintained against differ in every value a
+check might assume --
+
+    a -STABLE instance   base tree registered `null` and pointing at an
+                         ordinary /usr/ports; jail built from src
+    a -RELEASE instance  base tree registered `git+https` and maintained by
+                         poudriere itself under its own ports/<name>; jail
+                         from pkgbase
+
+-- and they do not even agree on where the overlay sits, since poudriere has
+used both `overlay/` and `overlays/` under BASEFS. So this file asserts NEITHER
+path: not the overlay's, and not the base tree's.
+
+THAT SECOND ONE IS THE TRAP WORTH NAMING. A `make -C /usr/ports/<port>` check
+is correct only where /usr/ports IS the tree poudriere builds from. On an
+instance with a poudriere-managed tree, /usr/ports may be an unrelated
+extraction years out of date -- and the check answers about it, cheerfully and
+wrongly. Every command below therefore takes $PORTS, which you set once to the
+tree THIS instance builds from (`poudriere ports -l` prints it), with
+PORTSDIR=$PORTS passed so the Mk files come from that tree too:
+
+    PORTS=/usr/ports                       # base tree registered null
+    PORTS=<BASEFS>/ports/<treename>        # base tree managed by poudriere
+
+A port is overlaid here if ANY instance needs it, and the instances do not
+build the same package set: one of the entries below is in no build list the
+other instance has. Both stay.
 
 The category Makefiles here exist only so `poudriere bulk -a` would enumerate
 the overlay (_list_ports_dir, common.sh:9479, skips an overlay with no
 top-level Makefile). Builds from an explicit list do not need them.
 
 
-x11/xlockmore  --  restores `tar:xz` to USES
--------------------------------------------
-Base tree resolves EXTRACT_SUFX to .tar.gz while distinfo holds the .tar.xz
-hash, so fetch refuses:
+RETIRED: x11/xlockmore
+----------------------
+This file carried a full section for x11/xlockmore -- base resolving
+EXTRACT_SUFX to .tar.gz against a .tar.xz distinfo, after ports commit
+6cd3e0d85531 swept tar:xz from 178 ports. TWO THINGS ABOUT IT, both measured on
+2026-10-22 and both reasons to drop the section rather than the port:
 
-    => xlockmore-5.88.tar.gz is not in .../distinfo.
+  THE OVERLAY NEVER CARRIED IT. No x11/ directory in either commit, nothing
+  uncommitted on either instance. The section described a fix that was written up
+  and never materialized, which is the more dangerous half: a reader would have
+  believed the port was covered here.
 
-Cause: ports commit 6cd3e0d85531 (Gleb Popov, 2026-09-08, PR 298092),
-"xorg-cat.mk users: Drop tar:xz, which is default now", removed tar:xz from
-178 ports. The premise holds for USES=xorg-cat, where Mk/Uses/xorg-cat.mk:71
-sets EXTRACT_SUFX?=.tar.xz. xlockmore uses USES=xorg, and Mk/Uses/xorg.mk sets
-nothing about tarballs -- so it fell back to the global .tar.gz default.
-tar:xz had been correct for this port since 5.80 (Oct 2024).
+  AND THE BASE TREE HAS CAUGHT UP, so there is nothing left to carry:
+  x11/xlockmore is 5.89 with tar:xz back in USES, and DISTFILES resolves to
+  xlockmore-5.89.tar.xz, matching distinfo.
 
-Of the 178 swept ports, this is the only one actually broken: the other
-non-xorg-cat port, x11-drivers/xf86-video-qxl, still resolves .tar.xz.
-Checked by comparing resolved DISTFILES against distinfo, not by the USES
-heuristic, which gave one false positive.
-
-WHY IT MATTERS HERE: xlockmore is installed, xautolock requires it, and
-~/.xinitrc:39 runs `xautolock -time 20 -locker lock` -- it is the screen lock.
-
-EXIT CONDITION: drop this port from the overlay once the base tree's
-x11/xlockmore/Makefile has tar:xz in USES again. Worth reporting upstream;
-PR 298092 was right for 177 of 178.
+Kept as a stub rather than deleted outright so the next reader of the git log
+does not go looking for a section the history shows being removed.
 
 
 security/py-authlib  --  removes a stray line-continuation backslash
@@ -62,8 +85,9 @@ March 2025 and survived the bump to 1.8.0. Reported upstream by cal; the bug
 report is open at the time of writing.
 
 EXIT CONDITION: drop this port once the base tree's line no longer ends in a
-backslash -- or simply once `make -C /usr/ports/security/py-authlib -V
-JOSE_RUN_DEPENDS` is non-empty.
+backslash -- or simply once `make -C $PORTS/security/py-authlib -V
+JOSE_RUN_DEPENDS PORTSDIR=$PORTS` is non-empty, with $PORTS this host's base
+tree per the table at the top.
 
 
 archivers/zpaqfranz  --  patches upstream's Makefile for install(1)
@@ -192,7 +216,8 @@ is identical above.
 
 EXIT CONDITION: drop this port once the base tree hands cmake the JDK itself --
 
-    env WITH=JAVA make -C /usr/ports/graphics/opencv -V CMAKE_ARGS | grep -c JAVA_HOME
+    env WITH=JAVA make -C $PORTS/graphics/opencv -V CMAKE_ARGS PORTSDIR=$PORTS \
+        | grep -c JAVA_HOME
 
 non-zero means the base tree has caught up, whichever mechanism it chose
 (JAVA_CMAKE_ON, CONFIGURE_ENV, or explicit JAVA_INCLUDE_PATH/JAVA_JVM_LIBRARY).
@@ -202,16 +227,46 @@ shipped on any modular JDK, and it fails late.
 
 Verifying the overlay after a ports update
 ------------------------------------------
-Both fixes are detectable in one command each, against the BASE tree:
+Each fix is detectable in one command, against the BASE tree -- set $PORTS to
+this host's, per the table at the top, and pass PORTSDIR=$PORTS so the Mk files
+come from the same tree you are asking about:
 
-    make -C /usr/ports/x11/xlockmore -V DISTFILES          # want .tar.xz
-    make -C /usr/ports/security/py-authlib -V JOSE_RUN_DEPENDS   # want non-empty
-    env WITH=JAVA make -C /usr/ports/graphics/opencv -V CMAKE_ARGS \
-        | grep -c JAVA_HOME                                # want non-zero
+    make -C $PORTS/security/py-authlib -V JOSE_RUN_DEPENDS PORTSDIR=$PORTS
+        # want NON-EMPTY: empty means the stray backslash is still there
 
-If either now reports the fixed value, the base tree has caught up and that
-port should leave the overlay -- a stale override is the thing an overlay is
-most likely to go wrong by.
+    env WITH=JAVA make -C $PORTS/graphics/opencv -V CMAKE_ARGS PORTSDIR=$PORTS \
+        | grep -c JAVA_HOME
+        # want NON-ZERO: zero means cmake is still not told where the JDK is
+
+    [ -d $PORTS/archivers/zpaqfranz/files ] && echo caught-up || echo still-ours
+        # zpaqfranz has no detectable VARIABLE: the defect is in the upstream
+        # Makefile inside the distfile, so the test is whether the base tree has
+        # grown a files/ directory of its own. Confirm by reading line 13 out of
+        # the tarball without extracting it:
+        #   tar -xOzf <distfiles>/zpaqfranz-55.12.tar.gz Makefile | sed -n 13p
+        # want: no `-l s` passed to ${BSD_INSTALL_PROGRAM}
+
+If one reports the fixed value, the base tree has caught up and that port should
+leave the overlay -- a stale override is the thing an overlay is most likely to
+go wrong by.
+
+ALSO CHECK THE VERSIONS, which is the other way a stale override goes wrong and
+the one no exit condition catches: an overlay entry is the whole port directory,
+so an entry left behind a base-tree version BUILDS THE OLD ONE silently.
+
+    for p in security/py-authlib archivers/zpaqfranz graphics/opencv; do
+        printf '%-24s base=%s overlay=%s\n' "$p" \
+          "$(make -C $PORTS/$p -V PKGVERSION PORTSDIR=$PORTS)" \
+          "$(make -C <this checkout>/$p -V PKGVERSION PORTSDIR=$PORTS)"
+    done
+
+LAST VERIFIED 2026-10-22, against a ports tree pulled that morning at
+freebsd/ports fe025fe81b3. All three still needed and none stale:
+
+    py-authlib   JOSE_RUN_DEPENDS empty      1.8.0 == 1.8.0
+    zpaqfranz    base has no files/          55.12_1 == 55.12_1, distinfo identical,
+                 and line 13 of the distfile still passes `-l s`
+    opencv       JAVA_HOME count 0           4.13.0_9 == 4.13.0_9
 
 
 bgone does NOT see this overlay
@@ -223,20 +278,26 @@ you configure options, bgone evaluates the BASE tree.
 
 Measured cost, by diffing every variable bgone reads, base vs overlay:
 
-  x11/xlockmore        every one identical. Its defect is EXTRACT_SUFX, which
-                       affects fetch and nothing bgone looks at. No cost.
   security/py-authlib  JOSE_RUN_DEPENDS and FLASK_RUN_DEPENDS differ.
 
-So the cost is one port and it is LATENT: RUN_DEPENDS reads the same today only
-because neither option is selected. Select JOSE in bgone and bgone will believe
-JOSE adds no dependency; select FLASK and it shows a bogus `JOSE_RUN_DEPENDS=`
-entry. That is exactly the decision bgone exists to inform.
+So the cost is one port. IT WAS DESCRIBED HERE AS LATENT -- "RUN_DEPENDS reads
+the same today only because neither option is selected" -- AND THAT DEPENDS ON
+THE SAVED OPTIONS, which are per instance and which poudriere resolves from the
+most specific options directory it finds. Measured 2026-10-22 on an instance
+whose saved options set CLIENTS, DJANGO and FLASK and unset JOSE, with a build
+log confirming FLASK=on in a real build: the BASE tree's RUN_DEPENDS then
+carries a token with no origin -- the literal `JOSE_RUN_DEPENDS=` -- plus a
+py-pycryptodomex that JOSE=off says should be absent. The overlay's is clean.
+
+So read "latent" as conditional on your own saved options rather than as a
+property of the port, and check which options directory is actually in play:
+renaming a per-jail one silently promotes the next match.
 
 IT DOES NOT BREAK THE BUILD. poudriere resolves the closure itself
 (deps_fetch_vars, common.sh:7062) from the OVERLAID Makefile, so
 py312-pycryptodomex is pulled in correctly even if bgone's list omits it.
-(It is currently in neither the local repo nor local-all.txt, so it would be a
-new build either way.)
+(It is currently in neither the local repo nor the build list, so it would be
+a new build either way.)
 
 `--poudriere-ports local-fixes` is mechanically accepted -- the overlay is a
 registered tree -- but it has no fallthrough, so dependency resolution for
